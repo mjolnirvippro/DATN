@@ -38,7 +38,6 @@ return items.map(item => {
     delete d.next_steps;
   }
 
-  // 🔧 FIX QUAN TRỌNG: alert_summary.ti_results phải là string, không được là object
   if (d.alert_summary && typeof d.alert_summary === 'object') {
     const as = d.alert_summary;
 
@@ -55,3 +54,4 @@ return items.map(item => {
 
   return { json: d };
 });
+
