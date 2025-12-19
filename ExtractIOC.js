@@ -1,15 +1,14 @@
 // ExtractIOC - chuẩn hoá alert Wazuh & set @timestamp
 
 return items.map(it => {
-  // raw có thể là body (Webhook) hoặc json trực tiếp
+
   const raw = it.json?.body ?? it.json ?? {};
 
-  // Nếu là hit của Wazuh (_index,_source,fields,sort) thì lấy _source, ngược lại dùng raw
+
   const hit    = raw._source || raw;
   const fields = raw.fields || {};
 
-  // --- ĐẢM BẢO LUÔN CÓ @timestamp ---
-  // Ưu tiên: @timestamp (nếu đã có) -> fields.timestamp[0] -> timestamp
+
   if (!hit['@timestamp']) {
     let ts = null;
 
@@ -28,8 +27,8 @@ return items.map(it => {
     }
   }
 
-  // --- Chuẩn hoá các phần còn lại như trước ---
-  const a = hit;                // giữ tên cũ cho dễ đọc
+
+  const a = hit;               
   const rule  = a.rule  || {};
   const agent = a.agent || {};
 
@@ -61,8 +60,9 @@ return items.map(it => {
     dst_ip: dstIp,
     dst_port: dstPort,
     ip: srcIp,
-    isPrivate: false, // bạn có thể thay bằng check IP nội bộ nếu muốn
+    isPrivate: false,
   };
 
   return { json: out };
 });
+
