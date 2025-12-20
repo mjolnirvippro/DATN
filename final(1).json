@@ -1,0 +1,531 @@
+{
+  "name": "final",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "/wazuh-alert",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -528,
+        304
+      ],
+      "id": "5aaa4d38-db25-4081-ba0e-652e14de9e98",
+      "name": "Webhook",
+      "webhookId": "18fb9d5d-1a0f-49f1-863a-6d26539e0053"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ExtractIOC - chuẩn hoá alert Wazuh & set @timestamp\n\nreturn items.map(it => {\n  // raw có thể là body (Webhook) hoặc json trực tiếp\n  const raw = it.json?.body ?? it.json ?? {};\n\n  // Nếu là hit của Wazuh (_index,_source,fields,sort) thì lấy _source, ngược lại dùng raw\n  const hit    = raw._source || raw;\n  const fields = raw.fields || {};\n\n  // --- ĐẢM BẢO LUÔN CÓ @timestamp ---\n  // Ưu tiên: @timestamp (nếu đã có) -> fields.timestamp[0] -> timestamp\n  if (!hit['@timestamp']) {\n    let ts = null;\n\n    if (hit['@timestamp']) {\n      ts = hit['@timestamp'];\n    } else if (Array.isArray(fields.timestamp) && fields.timestamp[0]) {\n      // trường hợp gửi nguyên hit từ wazuh-alerts-*\n      ts = fields.timestamp[0];\n    } else if (hit.timestamp) {\n      // trường hợp chỉ gửi _source vào webhook\n      ts = hit.timestamp;\n    }\n\n    if (ts) {\n      hit['@timestamp'] = ts;\n    }\n  }\n\n  // --- Chuẩn hoá các phần còn lại như trước ---\n  const a = hit;                // giữ tên cũ cho dễ đọc\n  const rule  = a.rule  || {};\n  const agent = a.agent || {};\n\n  const srcIp =\n    a.data?.srcip ||\n    a.data?.win?.system?.ipAddress ||\n    a.src_ip ||\n    a.source?.ip ||\n    a.ip;\n\n  const dstIp =\n    a.data?.dstip ||\n    a.data?.win?.eventdata?.destinationIp ||\n    a.dst_ip ||\n    a.destination?.ip;\n\n  const dstPort =\n    a.data?.dstport ||\n    a.data?.win?.eventdata?.destinationPort ||\n    a.dst_port ||\n    a.destination?.port ||\n    0;\n\n  const out = {\n    ...a,\n    rule,\n    agent,\n    src_ip: srcIp,\n    dst_ip: dstIp,\n    dst_port: dstPort,\n    ip: srcIp,\n    isPrivate: false, // bạn có thể thay bằng check IP nội bộ nếu muốn\n  };\n\n  return { json: out };\n});\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -336,
+        224
+      ],
+      "id": "d022461d-9eef-4880-982c-33bfbd41decf",
+      "name": "ExtractIOC"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ===================== Synthesize Enrichment (Extended, SOC-Ready) =====================\n// Mục tiêu: Giữ schema gọn, nhưng bổ sung thêm các trường quan trọng cho SOC.\n\n// ---------- Helpers ----------\nconst esc = (s) => String(s ?? '');\nconst clamp = (x, lo, hi) => Math.max(lo, Math.min(hi, x));\nconst uniqTrim = (arr) => [...new Set((arr || []).filter(Boolean).map(x => String(x).trim()))];\nconst toISO = (v) => {\n  if (!v) return null;\n  try {\n    if (typeof v === 'number') return new Date(v * (v > 1e12 ? 1 : 1000)).toISOString();\n    const d = new Date(v);\n    return isNaN(d) ? null : d.toISOString();\n  } catch { return null; }\n};\nconst by = (node, out = 0) => {\n  try {\n    const arr = $items(node, out, $runIndex) || [];\n    return arr[$itemIndex]?.json ?? null;\n  } catch { return null; }\n};\n\n// ---------- Base & TI Inputs ----------\nconst base = Object.assign({}, by('Webhook', 0), by('ExtractIOC', 0), $json || {});\nconst vtRaw  = by('VirusTotal check', 0) || {};\nconst otxRaw = by('AlienVault OTX check', 0) || {};\nconst vtRan  = Object.keys(vtRaw).length > 0;\nconst otxRan = Object.keys(otxRaw).length > 0;\n\n// ---------- Normalize VirusTotal ----------\nconst vtData = vtRaw.data || vtRaw || {};\nconst vtAttr = vtData.attributes || {};\nconst vtStats = vtAttr.last_analysis_stats || {};\nconst vt = vtRan ? {\n  harmless:   Number(vtStats.harmless   ?? 0),\n  malicious:  Number(vtStats.malicious  ?? 0),\n  suspicious: Number(vtStats.suspicious ?? 0),\n  undetected: Number(vtStats.undetected ?? 0),\n  reputation_norm: (vtAttr.reputation != null) ? ((Number(vtAttr.reputation) + 100) / 2) : null,\n  threat_label: vtAttr?.popular_threat_classification?.suggested_threat_label || null,\n  category: (() => {\n    const cat = vtAttr.categories;\n    if (!cat) return null;\n    const vals = Array.isArray(cat) ? cat : Object.values(cat);\n    return uniqTrim(vals).slice(0, 2).join(', ') || null;\n  })(),\n  permalink: vtData?.links?.self || null,\n  md5: vtAttr.md5 || null,\n  sha1: vtAttr.sha1 || null,\n  sha256: vtAttr.sha256 || null,\n  first_seen: toISO(vtAttr.first_submission_date),\n  last_seen:  toISO(vtAttr.last_submission_date),\n  engines_malicious: (() => {\n    const res = vtAttr.last_analysis_results || {};\n    const malEngines = Object.entries(res)\n      .filter(([k,v]) => v?.category === 'malicious')\n      .map(([k]) => k)\n      .slice(0, 5); // chỉ top 5 engine\n    return malEngines;\n  })()\n} : null;\n\n// ---------- Normalize AlienVault OTX ----------\nconst otxP = otxRaw?.pulse_info || {};\nconst otx = otxRan ? {\n  pulse_count: Number(otxP.count ?? (Array.isArray(otxP.pulses) ? otxP.pulses.length : 0)),\n  tags: uniqTrim((otxP.pulses || []).map(p => p?.name)).slice(0, 3),\n  references: (() => {\n    const refs = [];\n    (otxP.pulses || []).forEach(p => (p?.references || []).slice(0, 2).forEach(r => refs.push(r)));\n    return uniqTrim(refs).slice(0, 3);\n  })(),\n  malware_families: uniqTrim(\n    (otxP.pulses || [])\n      .flatMap(p => (p?.malware_families || []).map(m => m?.family_name))\n  ).slice(0, 3)\n} : null;\n\n// ---------- Scoring ----------\nconst vtScore = (() => {\n  if (!vt) return 0;\n  const total = (vt.malicious||0)+(vt.suspicious||0)+(vt.undetected||0)+(vt.harmless||0);\n  const ratio = total>0 ? (vt.malicious * 100 / total) : 0;\n  return vt.reputation_norm != null ? (ratio*0.5 + vt.reputation_norm*0.5) : ratio;\n})();\nconst otxScore = otx ? Math.min(90, (otx.pulse_count || 0) * 15) : 0;\nconst score = clamp(Math.round(((vtScore * 0.6) + (otxScore * 0.4)) * 10) / 10, 0, 100);\nconst hitCount = [\n  (vt && ((vt.malicious||0) > 0 || (vt.suspicious||0) > 0)),\n  (otx && (otx.pulse_count||0) > 0)\n].filter(Boolean).length;\nconst verdict = (() => {\n  if (score >= 70 || hitCount >= 2) return 'malicious';\n  if (score >= 40) return 'suspicious';\n  if (score < 20 && hitCount === 0) return 'benign';\n  return 'unknown';\n})();\nconst severity = score >= 70 ? 'High' : score >= 40 ? 'Medium' : 'Low';\n\n// ---------- Derived fields ----------\nconst first_seen = [vt?.first_seen, otx?.first_seen].filter(Boolean).sort()[0] || null;\nconst last_seen  = [vt?.last_seen,  otx?.last_seen ].filter(Boolean).sort().slice(-1)[0] || null;\nconst tags = uniqTrim([...(vt?.threat_label ? [vt.threat_label] : []), ...(vt?.category ? [vt.category] : []), ...(otx?.tags || [])]).slice(0, 5);\nconst references = uniqTrim([vt?.permalink, ...(otx?.references || [])]).slice(0, 3);\nconst trustedSources = uniqTrim([\n  ...(vt?.engines_malicious || []),\n  ...(otx?.tags || [])\n]).slice(0, 5);\n\nconst observedISO = toISO(base?.observed_at || base?.event?.timestamp || base?.['@timestamp']) || new Date().toISOString();\nconst generatedISO = new Date().toISOString();\n\n// ---------- Compact output (KEEP ExtractIOC + add TI) ----------\nconst out = { ...base };  // bắt đầu từ output sau ExtractIOC\n\n// @timestamp: ưu tiên observedISO\nout['@timestamp'] = observedISO;\n\n// ioc: merge thêm thông tin TI (md5/sha1/sha256) nhưng vẫn giữ ioc cũ nếu có\nout.ioc = {\n  ...(out.ioc || {}),\n  type: base.ioc_type || out.ioc?.type || 'unknown',\n  value: base.ioc_value || out.ioc?.value || '',\n  ...(vt?.md5 ? { md5: vt.md5 } : {}),\n  ...(vt?.sha1 ? { sha1: vt.sha1 } : {}),\n  ...(vt?.sha256 ? { sha256: vt.sha256 } : {}),\n};\n\n// ti: giữ nếu đã có, rồi bổ sung/ghi đè\nout.ti = (() => {\n  const tiOut = (out.ti && typeof out.ti === 'object') ? { ...out.ti } : {};\n\n  // Lấy thời điểm xảy ra alert làm fallback cho first_seen/last_seen\n  const occurredAt = base['@timestamp'] || out['@timestamp'] || new Date().toISOString();\n\n  // nguồn TI\n  const srcs = [];\n  if (vt) srcs.push('VirusTotal');\n  if (otx) srcs.push('OTX');\n  if (srcs.length) tiOut.sources = uniqTrim([...(tiOut.sources || []), ...srcs]);\n\n  // điểm & verdict\n  tiOut.score     = Number(isNaN(score) ? 0 : score);\n  tiOut.verdict   = verdict || 'unknown';\n\n  const hc = Number(isNaN(hitCount) ? 0 : hitCount);\n  tiOut.hit_count = hc;\n\n  // always set first_seen / last_seen để mapping date có dữ liệu\n  tiOut.first_seen = first_seen || tiOut.first_seen || occurredAt;\n  tiOut.last_seen  = last_seen  || tiOut.last_seen  || occurredAt;\n\n  // tham chiếu & nguồn xác nhận\n  if (references && references.length) {\n    tiOut.references = uniqTrim([...(tiOut.references || []), ...references]);\n  }\n  if (trustedSources && trustedSources.length) {\n    tiOut.confirmed_by = uniqTrim([...(tiOut.confirmed_by || []), ...trustedSources]);\n  }\n\n  // VT sub-object\n  if (vt) {\n    tiOut.vt = {\n      ...(tiOut.vt || {}),\n      malicious:       Number(vt.malicious   ?? 0),\n      suspicious:      Number(vt.suspicious  ?? 0),\n      reputation_norm: Math.round(Number(vt.reputation_norm ?? 0) * 10) / 10,\n    };\n  }\n\n  // OTX sub-object\n  if (otx) {\n    tiOut.otx = {\n      ...(tiOut.otx || {}),\n      pulse_count: Number(otx.pulse_count ?? 0),\n    };\n  }\n\n  return tiOut;\n})();\n\n// geo: merge thêm country/asn nhưng không xoá field cũ nếu có\nout.geo = {\n  ...(out.geo || {}),\n  ...(base.geo?.country ? { country: base.geo.country } : {}),\n  ...(base.asn ? { asn: base.asn } : {}),\n};\n\n// đảm bảo alias src_ip/dst_ip/dst_port tồn tại (nhưng không xoá cái cũ)\nif (base.src_ip)  out.src_ip  = base.src_ip;\nif (base.dst_ip)  out.dst_ip  = base.dst_ip;\nif (base.dst_port) out.dst_port = base.dst_port;\n\n// rule/agent: merge thêm id/description/id/name nhưng giữ các field khác\nif (base.rule) {\n  out.rule = { ...(out.rule || {}), ...base.rule };\n}\nif (base.agent) {\n  out.agent = { ...(out.agent || {}), ...base.agent };\n}\n\n// risk_score tổng hợp\nout.risk_score = score;\n\n// ---------- Output ----------\ndelete out._index;\ndelete out._id;\ndelete out._version;\ndelete out._score;\ndelete out.fields;\ndelete out.sort;\n\nconst x = $json;\n\n// helper: lấy an toàn\nconst get = (p, d=null) => p.split('.').reduce((o,k)=> (o && o[k] !== undefined) ? o[k] : d, x);\n\n// helper: cắt chuỗi dài\nconst trunc = (s, n=500) => (typeof s === 'string' && s.length > n) ? (s.slice(0, n) + '...') : s;\n\nreturn [{ json: out }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        208,
+        144
+      ],
+      "id": "65098dbe-3bde-4274-a190-efe310c57a07",
+      "name": "Synthesize Enrichment"
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        224,
+        464
+      ],
+      "id": "9985234b-b71a-49f6-8dd1-dbd7c5ac9978",
+      "name": "Merge"
+    },
+    {
+      "parameters": {
+        "url": "=https://otx.alienvault.com/api/v1/indicators/IPv4/{{ $json.ip }}/general",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-OTX-API-KEY",
+              "value": "63a56e2120ac241d9dd88045df71cefd07144c7d42b14c7a036bd5ecf62f0f7e"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        48,
+        560
+      ],
+      "id": "73fbc38f-e27e-403e-85ca-a2007d17bbfc",
+      "name": "AlienVault OTX check",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "6bdc60df-1405-44f2-8dea-f82864177411",
+              "leftValue": "={{ $json.isPrivate }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "or"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -336,
+        432
+      ],
+      "id": "c4000af9-cc54-43cb-af7b-8101a0a71f3e",
+      "name": "isPrivate"
+    },
+    {
+      "parameters": {
+        "jsCode": "return [{\n  json: {\n    ...$json,\n    t_enrich_start: new Date().toISOString()\n  }\n}];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -112,
+        368
+      ],
+      "id": "a198f752-2947-4022-83e6-3cd1d7f11c7c",
+      "name": "Mark enrich start"
+    },
+    {
+      "parameters": {
+        "jsCode": "return [{\n  json: {\n    note: \"Private IP detected — skipping external enrichment\",\n    ip: $json.ip,\n    alert: $json.alert,\n    ioc: $json.ioc,\n    reputation_score_0_1: 0,\n    skip_external: true\n  }\n}];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -80,
+        144
+      ],
+      "id": "2e27fecd-3ed4-4590-9a55-54292cdede86",
+      "name": "Internal skip node"
+    },
+    {
+      "parameters": {
+        "url": "=https://www.virustotal.com/api/v3/ip_addresses/{{ $json.ip }}\n",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-apikey",
+              "value": "533c77eec90e2bc7eea29c6fc7f695fbb240184ec6f05ff530800ada79d2a92f"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        48,
+        384
+      ],
+      "id": "9a67c3ed-d634-41b1-aa13-25501fbd5bb5",
+      "name": "VirusTotal check",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{\n  JSON.stringify({\n    ...$json.body._source,\n    data: {\n      ...$json.body._source.data,\n      win: {\n        ...$json.body._source.data.win,\n        system: {\n          ...$json.body._source.data.win.system,\n          message: ($json.body._source.data.win.system.message || \"\").slice(0, 00)\n        }\n      }\n    }\n  })\n}}\n",
+        "options": {
+          "systemMessage": "1. Alert summary: based only alert date, no assumptions,write one concise paragraph that covers:\n-When the alert occurred\n-What alert was suspicious impact (what process, cmdline, ...)\n-Where the alert originated (IP or Computer name)\n-How/why the alert occurred \n-1 line for TI results \n-The impact of the alert to the CIA \n2. Action: \n- Verify with user whether this action was acknowledged.\n- How to further investigate\nsend me only result as standard json format"
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 2.2,
+      "position": [
+        432,
+        368
+      ],
+      "id": "2347e03b-565d-4783-819e-f13500a29641",
+      "name": "AI Agent"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse JSON trong trường output \n/**\nreturn [\n  JSON.parse($json[\"output\"])\n];\n */\nlet raw = $json.output;\n\n// Bỏ phần ```json đầu và ``` cuối\nraw = raw\n  .replace(/^```[a-zA-Z]*\\n/, \"\")   // xóa ``` hoặc ```json ở đầu\n  .replace(/\\n```$/, \"\")            // xóa ``` ở cuối\n  .trim();\n\n// Parse thành object\nconst obj = JSON.parse(raw);\n\n// Trả object này làm item mới\nreturn obj;\n\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        720,
+        400
+      ],
+      "id": "6810bc34-81b3-44b4-933d-38c2a0a14f94",
+      "name": "AI enrich"
+    },
+    {
+      "parameters": {
+        "numberInputs": 3
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        848,
+        256
+      ],
+      "id": "ff6b5645-9a47-4d13-9b54-e16402ba1ca8",
+      "name": "Forward to SIEM"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://192.168.80.128:9200/_bulk",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {}
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/x-ndjson",
+        "body": "={{$json[\"ndjson\"]}}",
+        "options": {
+          "allowUnauthorizedCerts": true
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1328,
+        272
+      ],
+      "id": "47fd485a-8099-4dd3-a761-bc7cc8e7424b",
+      "name": "HTTP Request",
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "8v0zETPs8FPJ0ogC",
+          "name": "Unnamed credential"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Normalize payload to match mapping\nreturn items.map(item => {\n  const d = { ...item.json };\n\n  // ioc_type/ioc_value -> ioc.{type,value}\n  if (d.ioc_type && d.ioc_value) {\n    d.ioc = d.ioc || {};\n    d.ioc.type  = d.ioc.type  || d.ioc_type;\n    d.ioc.value = d.ioc.value || d.ioc_value;\n    delete d.ioc_type;\n    delete d.ioc_value;\n  }\n\n  // observed_at -> @timestamp\n  if (d.observed_at && !d['@timestamp']) {\n    d['@timestamp'] = d.observed_at;\n    delete d.observed_at;\n  }\n\n  // asn (top) -> geo.asn\n  if (d.asn) {\n    d.geo = d.geo || {};\n    d.geo.asn = String(d.asn);\n    delete d.asn;\n  }\n\n  // Summary block -> ai.*\n  if (typeof d.summary === 'string' && !d.ai) {\n    d.ai = {\n      summary: d.summary,\n      analysis: d.analysis,\n      recommendations: d.recommendations,\n      next_steps: d.next_steps,\n    };\n    delete d.summary;\n    delete d.analysis;\n    delete d.recommendations;\n    delete d.next_steps;\n  }\n\n  // 🔧 FIX QUAN TRỌNG: alert_summary.ti_results phải là string, không được là object\n  if (d.alert_summary && typeof d.alert_summary === 'object') {\n    const as = d.alert_summary;\n\n    if (as.ti_results && typeof as.ti_results === 'object') {\n      const score   = as.ti_results.score;\n      const verdict = as.ti_results.verdict;\n\n      // Chuyển thành chuỗi ngắn gọn cho analyst, đúng kiểu \"text\"\n      as.ti_results = `verdict=${verdict ?? 'unknown'}, score=${score ?? 'N/A'}`;\n    }\n\n    d.alert_summary = as;\n  }\n\n  return { json: d };\n});\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1008,
+        272
+      ],
+      "id": "debea2bc-48e0-489c-a6a1-bc0c9a473217",
+      "name": "normalize"
+    },
+    {
+      "parameters": {
+        "jsCode": "const index = \"wazuh-ai-v2002\";\n\n// --- helpers ---\nfunction normalizeIso(ts) {\n  if (!ts || typeof ts !== \"string\") return null;\n  const m = ts.match(/^(.+?\\.\\d{3})\\d*(Z|[+-]\\d{2}:?\\d{2})$/);\n  if (m) return `${m[1]}${m[2]}`;\n  return ts;\n}\n\nfunction unwrapEvent(doc) {\n  // webhook wrapper\n  if (doc?.body?._source) return doc.body._source;\n  // already event core\n  if (doc?.agent && doc?.rule && doc?.data) return doc;\n  return null;\n}\n\nfunction pickDocId(items) {\n  // ưu tiên Wazuh _id gốc\n  for (const it of items) {\n    const j = it.json;\n    if (j?.body?._id) return String(j.body._id);\n    if (j?._id) return String(j._id);\n  }\n  return null;\n}\n\nfunction pickTi(items) {\n  // ưu tiên item có ti ở top-level (như item #3 bạn gửi)\n  for (const it of items) {\n    const j = it.json;\n    if (j?.ti || j?.ioc || j?.risk_score !== undefined) {\n      return {\n        ioc: j.ioc,\n        ti: j.ti,\n        risk_score: j.risk_score,\n      };\n    }\n    // đôi khi TI nằm trong body\n    if (j?.body?.ti || j?.body?.ioc || j?.body?.risk_score !== undefined) {\n      return {\n        ioc: j.body.ioc,\n        ti: j.body.ti,\n        risk_score: j.body.risk_score,\n      };\n    }\n  }\n  return {};\n}\n\nfunction pickAi(items) {\n  // AI của bạn hiện đang có schema: { event: {...}, action_taken: {...} }\n  for (const it of items) {\n    const j = it.json;\n    if (j?.event || j?.action_taken) return j;\n    if (j?.body?.event || j?.body?.action_taken) return j.body;\n  }\n  return {};\n}\n\nfunction mapAiToOldSchema(ai) {\n  // output về dạng bạn hay dùng: action.verifyWithUser + action.furtherInvestigation\n  const out = {};\n\n  // 1) alert_summary (tùy bạn có muốn giữ không)\n  // Mình giữ dưới alert_summary để dễ dùng dashboard, còn bạn có thể bỏ nếu không cần\n  if (ai?.event && typeof ai.event === \"object\") {\n    out.alert_summary = ai.event;\n  }\n\n  // 2) action.* theo schema cũ\n  const action = {};\n\n  // verifyWithUser: nếu AI nói \"Not acknowledged yet\" -> false, còn lại true (không set now, không bịa thêm)\n  const ack = ai?.action_taken?.acknowledged_by_user;\n  if (typeof ack === \"string\") {\n    action.verifyWithUser = !ack.toLowerCase().includes(\"not\");\n  } else {\n    // nếu thiếu field ack thì mặc định true (theo system message “Verify with user…”)\n    action.verifyWithUser = true;\n  }\n\n  // furtherInvestigation: join array -> string\n  const inv = ai?.action_taken?.further_investigation_needed;\n  if (Array.isArray(inv)) action.furtherInvestigation = inv.join(\"; \");\n  else if (typeof inv === \"string\") action.furtherInvestigation = inv;\n\n  out.action = action;\n  return out;\n}\n\n// --- MAIN ---\n\n// 1) event core (ưu tiên lấy từ body._source nếu có)\nlet eventCore = null;\nfor (const it of items) {\n  const e = unwrapEvent(it.json);\n  if (e) { eventCore = e; break; }\n}\nif (!eventCore) {\n  throw new Error(\"Cannot find event core (body._source or event fields).\");\n}\n\n// 2) giữ nguyên @timestamp cũ từ event\nconst eventTs = normalizeIso(eventCore[\"@timestamp\"]);\nif (eventTs) eventCore[\"@timestamp\"] = eventTs;\n\n// 3) TI từ item có ti/ioc/risk_score\nconst tiPack = pickTi(items);\n\n// 4) AI mapping về schema bạn cần\nconst aiRaw = pickAi(items);\nconst aiMapped = mapAiToOldSchema(aiRaw);\n\n// 5) merge final\nconst merged = {\n  ...eventCore,\n  ...(tiPack.ioc ? { ioc: tiPack.ioc } : {}),\n  ...(tiPack.ti ? { ti: tiPack.ti } : {}),\n  ...(tiPack.risk_score !== undefined ? { risk_score: tiPack.risk_score } : {}),\n  ...(aiMapped.alert_summary ? { alert_summary: aiMapped.alert_summary } : {}),\n  ...(aiMapped.action ? { action: aiMapped.action } : {}),\n};\n\n// 6) docId ổn định để UPDATE + upsert\nconst docId = pickDocId(items);\nif (!docId) {\n  throw new Error(\"Cannot find body._id for stable upsert. (Need Wazuh _id to merge into 1 doc.)\");\n}\n\n// 7) Bulk UPDATE (gộp 2-3 doc thành 1 record trên SIEM)\nlet ndjson = \"\";\nndjson += JSON.stringify({ update: { _index: index, _id: docId } }) + \"\\n\";\nndjson += JSON.stringify({ doc: merged, doc_as_upsert: true }) + \"\\n\";\n\nreturn [{ json: { ndjson } }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1152,
+        272
+      ],
+      "id": "3baacaed-1e80-4e24-8394-bec673c9be05",
+      "name": "merge bulk"
+    },
+    {
+      "parameters": {
+        "chatId": "6050883700",
+        "text": "=<pre>{{ JSON.stringify($json, null, 2) }}</pre>\n",
+        "additionalFields": {
+          "appendAttribution": true,
+          "parse_mode": "=HTML"
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1120,
+        512
+      ],
+      "id": "71cadb67-49b4-465d-a8c2-9203536547c1",
+      "name": "Telegram mess",
+      "webhookId": "cba89131-8ae2-4f2c-ae46-22837c569436",
+      "alwaysOutputData": false,
+      "credentials": {
+        "telegramApi": {
+          "id": "zUvBICFrEKE5kJ9D",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "llama3.1:8b",
+          "mode": "list",
+          "cachedResultName": "llama3.1:8b"
+        },
+        "responsesApiEnabled": false,
+        "options": {
+          "maxTokens": 1000,
+          "timeout": 1000000
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.3,
+      "position": [
+        432,
+        576
+      ],
+      "id": "4c6c0ff4-129c-474e-939f-092e3be6d6b8",
+      "name": "OpenAI Chat Model",
+      "credentials": {
+        "openAiApi": {
+          "id": "LGWjfZQrudl3XAXD",
+          "name": "OpenAi account"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "ExtractIOC",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "ExtractIOC": {
+      "main": [
+        [
+          {
+            "node": "isPrivate",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Forward to SIEM",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AlienVault OTX check": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Merge": {
+      "main": [
+        [
+          {
+            "node": "Synthesize Enrichment",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "isPrivate": {
+      "main": [
+        [
+          {
+            "node": "Internal skip node",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark enrich start",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Synthesize Enrichment": {
+      "main": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Forward to SIEM",
+            "type": "main",
+            "index": 2
+          }
+        ]
+      ]
+    },
+    "Mark enrich start": {
+      "main": [
+        [
+          {
+            "node": "VirusTotal check",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "AlienVault OTX check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Internal skip node": {
+      "main": [
+        [
+          {
+            "node": "Synthesize Enrichment",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "VirusTotal check": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent": {
+      "main": [
+        [
+          {
+            "node": "AI enrich",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI enrich": {
+      "main": [
+        [
+          {
+            "node": "Telegram mess",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Forward to SIEM",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Forward to SIEM": {
+      "main": [
+        [
+          {
+            "node": "normalize",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "normalize": {
+      "main": [
+        [
+          {
+            "node": "merge bulk",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "merge bulk": {
+      "main": [
+        [
+          {
+            "node": "HTTP Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "82d68dcf-2d98-407c-8b8f-3c541cdf5257",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "9db748fb0af2fea09b07217468e3d97a7900e8093e9130f04d50f2b2bfc59c22"
+  },
+  "id": "ZPSMChl3JvJ3qsFT",
+  "tags": []
+}
